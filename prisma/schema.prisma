@@ -1,0 +1,440 @@
+// Food delivery MVP — single market, web-only.
+//
+// Conventions (deliberate, please keep):
+//   * All money is an Int in MINOR units (paise / cents). Never a Float.
+//   * Orders SNAPSHOT names + prices. Menus change; order history must not.
+//   * Menu rows are archived, never deleted — orders reference them.
+//   * Every status change is appended to OrderStatusEvent (support + disputes).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------- enums
+
+enum UserRole {
+  CUSTOMER
+  RESTAURANT_STAFF
+  ADMIN
+}
+
+enum StaffRole {
+  OWNER
+  MANAGER
+  STAFF
+}
+
+enum OrderType {
+  DELIVERY
+  PICKUP
+}
+
+/// Self-delivery flow. No driver client in the MVP.
+///   PLACED -> ACCEPTED -> PREPARING -> OUT_FOR_DELIVERY -> DELIVERED   (delivery)
+///   PLACED -> ACCEPTED -> PREPARING -> READY_FOR_PICKUP  -> COLLECTED  (pickup)
+///   PLACED -> REJECTED | CANCELLED
+enum OrderStatus {
+  PLACED
+  ACCEPTED
+  PREPARING
+  READY_FOR_PICKUP
+  OUT_FOR_DELIVERY
+  DELIVERED
+  COLLECTED
+  REJECTED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  ONLINE
+  COD
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum OptionSelectionType {
+  SINGLE
+  MULTIPLE
+}
+
+// ---------------------------------------------------------------- identity
+
+model User {
+  id        String   @id @default(cuid())
+  phone     String   @unique
+  email     String?  @unique
+  name      String?
+  role      UserRole @default(CUSTOMER)
+  isBlocked Boolean  @default(false)
+
+  /// External auth provider subject (Clerk / Auth.js). Null until first login.
+  authProviderId String? @unique
+
+  addresses  Address[]
+  orders     Order[]
+  staffRoles RestaurantStaff[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([role])
+}
+
+model Address {
+  id         String  @id @default(cuid())
+  userId     String
+  label      String? // "Home", "Office"
+  line1      String
+  line2      String?
+  landmark   String?
+  city       String
+  postalCode String
+  latitude   Float?
+  longitude  Float?
+  isDefault  Boolean @default(false)
+
+  /// Resolved at save time so checkout never has to guess deliverability.
+  zoneId String?
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  zone   Zone?   @relation(fields: [zoneId], references: [id], onDelete: SetNull)
+  orders Order[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([postalCode])
+}
+
+// ---------------------------------------------------------------- geography
+
+/// MVP deliverability: flat fee per zone, matched on postal code.
+/// No Distance Matrix API calls, no per-request billing. Swap for
+/// real routing when a second city appears.
+model Zone {
+  id               String   @id @default(cuid())
+  name             String
+  city             String
+  postalCodes      String[]
+  deliveryFeeMinor Int      @default(0)
+  minOrderMinor    Int      @default(0)
+  etaMinutes       Int      @default(40)
+  isActive         Boolean  @default(true)
+
+  addresses   Address[]
+  restaurants RestaurantZone[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([city, name])
+  @@index([isActive])
+}
+
+// ---------------------------------------------------------------- merchant
+
+model Restaurant {
+  id          String  @id @default(cuid())
+  slug        String  @unique
+  name        String
+  description String?
+  imageUrl    String?
+  phone       String
+  line1       String
+  city        String
+  postalCode  String
+  latitude    Float?
+  longitude   Float?
+
+  /// isActive  = admin-controlled (onboarded / suspended)
+  /// isAcceptingOrders = merchant's own panic switch, honoured over hours
+  isActive          Boolean @default(false)
+  isAcceptingOrders Boolean @default(true)
+
+  packingFeeMinor   Int     @default(0)
+  taxPercent        Decimal @default(0) @db.Decimal(5, 2)
+  commissionPercent Decimal @default(0) @db.Decimal(5, 2)
+  avgPrepMinutes    Int     @default(25)
+
+  categories   MenuCategory[]
+  items        MenuItem[]
+  orders       Order[]
+  staff        RestaurantStaff[]
+  zones        RestaurantZone[]
+  openingHours OpeningHours[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive, isAcceptingOrders])
+  @@index([city])
+}
+
+model RestaurantStaff {
+  id           String    @id @default(cuid())
+  userId       String
+  restaurantId String
+  role         StaffRole @default(STAFF)
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, restaurantId])
+  @@index([restaurantId])
+}
+
+model RestaurantZone {
+  restaurantId String
+  zoneId       String
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  zone       Zone       @relation(fields: [zoneId], references: [id], onDelete: Cascade)
+
+  @@id([restaurantId, zoneId])
+  @@index([zoneId])
+}
+
+model OpeningHours {
+  id           String  @id @default(cuid())
+  restaurantId String
+  /// 0 = Sunday .. 6 = Saturday
+  dayOfWeek    Int
+  /// "HH:mm" in the restaurant's local time
+  opensAt      String
+  closesAt     String
+  isClosed     Boolean @default(false)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+
+  @@unique([restaurantId, dayOfWeek])
+}
+
+// ---------------------------------------------------------------- menu
+
+model MenuCategory {
+  id           String  @id @default(cuid())
+  restaurantId String
+  name         String
+  sortOrder    Int     @default(0)
+  isArchived   Boolean @default(false)
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  items      MenuItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([restaurantId, sortOrder])
+}
+
+model MenuItem {
+  id           String   @id @default(cuid())
+  restaurantId String
+  categoryId   String
+  name         String
+  description  String?
+  priceMinor   Int
+  imageUrl     String?
+  isVeg        Boolean?
+  /// Merchant's out-of-stock toggle — flipped many times a day.
+  isAvailable  Boolean  @default(true)
+  isArchived   Boolean  @default(false)
+  sortOrder    Int      @default(0)
+
+  restaurant   Restaurant    @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  category     MenuCategory  @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  optionGroups OptionGroup[]
+  orderItems   OrderItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([restaurantId, isArchived, isAvailable])
+  @@index([categoryId, sortOrder])
+}
+
+model OptionGroup {
+  id            String              @id @default(cuid())
+  menuItemId    String
+  name          String
+  selectionType OptionSelectionType @default(SINGLE)
+  minSelect     Int                 @default(0)
+  maxSelect     Int                 @default(1)
+  sortOrder     Int                 @default(0)
+
+  menuItem MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  options  Option[]
+
+  @@index([menuItemId, sortOrder])
+}
+
+model Option {
+  id              String  @id @default(cuid())
+  optionGroupId   String
+  name            String
+  priceDeltaMinor Int     @default(0)
+  isAvailable     Boolean @default(true)
+  sortOrder       Int     @default(0)
+
+  optionGroup      OptionGroup       @relation(fields: [optionGroupId], references: [id], onDelete: Cascade)
+  orderItemOptions OrderItemOption[]
+
+  @@index([optionGroupId, sortOrder])
+}
+
+// ---------------------------------------------------------------- orders
+
+model Order {
+  id           String      @id @default(cuid())
+  /// Short human-readable reference used in support and on receipts.
+  orderNumber  String      @unique
+  customerId   String
+  restaurantId String
+  addressId    String? // null for PICKUP
+  type         OrderType   @default(DELIVERY)
+  status       OrderStatus @default(PLACED)
+
+  /// Guards against a double-tapped "Place Order" creating two orders.
+  idempotencyKey String @unique
+
+  // --- price breakdown, all computed SERVER-SIDE. Never trust a client total.
+  subtotalMinor    Int
+  packingFeeMinor  Int @default(0)
+  deliveryFeeMinor Int @default(0)
+  taxMinor         Int @default(0)
+  discountMinor    Int @default(0)
+  totalMinor       Int
+
+  /// Snapshot: the delivery address as it was at checkout.
+  addressSnapshot Json?
+  contactPhone    String
+  customerNote    String?
+
+  prepMinutes      Int?
+  estimatedReadyAt DateTime?
+  acceptedAt       DateTime?
+  deliveredAt      DateTime?
+  cancelledAt      DateTime?
+  cancelReason     String?
+
+  customer   User               @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  restaurant Restaurant         @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  address    Address?           @relation(fields: [addressId], references: [id], onDelete: SetNull)
+  items      OrderItem[]
+  events     OrderStatusEvent[]
+  payment    Payment?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([restaurantId, status, createdAt])
+  @@index([customerId, createdAt])
+  @@index([status])
+}
+
+model OrderItem {
+  id         String  @id @default(cuid())
+  orderId    String
+  menuItemId String?
+
+  /// Snapshots — the menu item may later be renamed, repriced, or archived.
+  nameSnapshot   String
+  unitPriceMinor Int
+  quantity       Int
+  lineTotalMinor Int
+  note           String?
+
+  order    Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItem MenuItem?         @relation(fields: [menuItemId], references: [id], onDelete: SetNull)
+  options  OrderItemOption[]
+
+  @@index([orderId])
+}
+
+model OrderItemOption {
+  id          String  @id @default(cuid())
+  orderItemId String
+  optionId    String?
+
+  groupNameSnapshot String
+  nameSnapshot      String
+  priceDeltaMinor   Int
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  option    Option?   @relation(fields: [optionId], references: [id], onDelete: SetNull)
+
+  @@index([orderItemId])
+}
+
+/// Append-only audit trail. Every support conversation starts here.
+model OrderStatusEvent {
+  id        String      @id @default(cuid())
+  orderId   String
+  status    OrderStatus
+  note      String?
+  /// Null when the transition was made by the system (e.g. auto-cancel).
+  actorId   String?
+  actorRole UserRole?
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId, createdAt])
+}
+
+// ---------------------------------------------------------------- payments
+
+model Payment {
+  id      String        @id @default(cuid())
+  orderId String        @unique
+  method  PaymentMethod
+  status  PaymentStatus @default(PENDING)
+
+  /// "razorpay" | "stripe" | "cod" — kept as a string so the provider
+  /// choice is not baked into the schema.
+  provider          String
+  providerOrderId   String?
+  providerPaymentId String? @unique
+
+  amountMinor         Int
+  refundedAmountMinor Int       @default(0)
+  failureReason       String?
+  paidAt              DateTime?
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+/// Payment webhooks arrive more than once. Insert here first; a unique
+/// violation means "already handled" and the handler can return 200.
+model WebhookEvent {
+  id          String    @id @default(cuid())
+  provider    String
+  externalId  String
+  payload     Json
+  processedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@unique([provider, externalId])
+}
