@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 const NAV = [
   { href: "/dashboard", label: "Orders" },
@@ -24,6 +25,9 @@ export default function DashboardLayout({ children }: LayoutProps<"/dashboard">)
               </Link>
             ))}
           </nav>
+          <div className="ml-auto">
+            <ThemeToggle />
+          </div>
         </div>
       </header>
       <main className="flex-1 px-4 py-6 sm:px-6">{children}</main>
