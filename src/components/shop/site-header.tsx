@@ -7,6 +7,7 @@ import { apiFetch } from "@/lib/api-client";
 import { useSession } from "@/lib/use-session";
 import { selectItemCount, useCart } from "@/lib/stores/cart";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 export function SiteHeader() {
   const { data } = useSession();
@@ -59,6 +60,7 @@ export function SiteHeader() {
               Sign in
             </Link>
           )}
+          <ThemeToggle />
         </nav>
       </div>
     </header>
